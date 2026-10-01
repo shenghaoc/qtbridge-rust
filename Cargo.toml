@@ -85,3 +85,8 @@ default-members = [
 # because a package being dependency is built twice with different optimization settings.
 # Hardcode optimization level to help cargo deduplicate dependencies and run build script only once.
 opt-level = 3
+
+# The model tests only catch proxy aliasing bugs when this crate is optimized
+# (QTBRIDGES-409).
+[profile.test.package.qtbridge-interfaces]
+opt-level = 3

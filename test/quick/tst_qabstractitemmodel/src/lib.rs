@@ -176,6 +176,16 @@ mod backend {
         }
     }
 
+    impl Backend {
+        #[qslot]
+        fn insert_top_level_row(&mut self) {
+            let row = self.root.row_count() as i32;
+            self.begin_insert_rows(&QModelIndex::default(), row, row);
+            self.root.add_child(Row::new(5));
+            self.end_insert_rows();
+        }
+    }
+
     impl QAbstractItemModel for Backend {
         fn index(&self, row: i32, column: i32, parent: &QModelIndex) -> QModelIndex {
             if parent.is_valid() {

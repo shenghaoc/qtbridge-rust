@@ -26,6 +26,15 @@ TestCase {
         visible: true
     }
 
+    // Deliberately re-enters the model synchronously from beginInsertRows()
+    property var rowCountsSeenOnInsert: []
+    Connections {
+        target: rustmodel
+        function onRowsAboutToBeInserted() {
+            test.rowCountsSeenOnInsert.push(rustmodel.rowCount())
+        }
+    }
+
     function check_sync() {
         listview.forceLayout()
 
@@ -97,5 +106,13 @@ TestCase {
         compare(rustmodel.data(rustmodel.index(1, 0), 0), "")
         compare(rustmodel.data(rustmodel.index(2, 0), 0), "")
         check_sync()
+    }
+
+    function test_push_reenters_row_count() {
+        const before = rustmodel.rowCount()
+        rowCountsSeenOnInsert = []
+        rustmodel.pushFourItems()
+        compare(rowCountsSeenOnInsert, [before, before + 1, before + 2, before + 3])
+        compare(rustmodel.rowCount(), before + 4)
     }
 }
