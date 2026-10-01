@@ -139,3 +139,169 @@ macro_rules! impl_qcpp_proxy {
         }
     };
 }
+
+/// Pure-Rust model of the synchronous Qt re-entry that model notifications
+/// trigger (`beginInsertRows()` -> `rowCount()`), driven through the real
+/// `GenericRustProxy`, `RustObjAccess` and `call_cpp_impl!` /
+/// `call_rust_trait_impl!`. The "C++" proxy is a Rust type that re-enters the
+/// Rust proxy through a raw pointer, exactly as the CXX shims do.
+///
+/// These tests also pass natively with an exclusive proxy receiver, because
+/// whether the optimizer exploits it is not specified. Run them under Miri
+/// (`cargo miri test -p qtbridge-interfaces --lib`, with or without
+/// `-Zmiri-tree-borrows`) to check the aliasing contract: a `&mut` proxy
+/// receiver in the wrappers below is reported as undefined behavior there.
+///
+/// The `FakeProxy` wrappers mirror, but are not, the `base_*` / `set_data`
+/// methods of the model proxies; the Qt quick tests (`tst_qlistmodel` & co.)
+/// cover those.
+#[cfg(test)]
+mod reentrancy_tests {
+    use super::*;
+    use qtbridge_runtime::qproxies::QCppProxy;
+    use qtbridge_type_lib::QMetaObject;
+    use std::pin::Pin;
+
+    trait FakeAdapter: DispatchMetaCall + 'static {
+        fn row_count(&self) -> i32;
+        fn insert_row(&mut self);
+        fn set_data(&mut self);
+    }
+
+    struct Model {
+        rows: i32,
+        proxy: *const FakeProxy,
+    }
+
+    type FakeProxy = GenericRustProxy<FakeCpp, dyn FakeAdapter>;
+
+    struct FakeCpp {
+        rust_proxy: *const FakeProxy,
+        seen_row_counts: Vec<i32>,
+    }
+
+    unsafe impl DispatchMetaCall for Model {
+        unsafe fn invoke_slot(&self, _: u32, _: &[*const u8], _: &[*mut u8]) {}
+        // A `&mut self` slot, like `Backend::add_string` in minimal_app.
+        unsafe fn invoke_slot_mut(&mut self, _: u32, _: &[*const u8], _: &[*mut u8]) {
+            self.insert_row();
+        }
+        unsafe fn read_property(&self, _: u32) -> QVariant {
+            QVariant::default()
+        }
+        unsafe fn write_property(&mut self, _: u32, _: &QVariant) {}
+    }
+
+    impl FakeAdapter for Model {
+        fn row_count(&self) -> i32 {
+            self.rows
+        }
+        // Shape of `QListModelBase::push`.
+        fn insert_row(&mut self) {
+            let proxy = unsafe { &*self.proxy };
+            proxy.base_begin_insert_rows(&mut *self);
+            self.rows += 1;
+        }
+        // Shape of `QListModelAdapter::set_data`.
+        fn set_data(&mut self) {
+            let proxy = unsafe { &*self.proxy };
+            proxy.base_data_changed(&mut *self);
+        }
+    }
+
+    impl FakeProxy {
+        // Inbound, like `QListModelProxyRust::row_count`.
+        fn row_count(&self) -> i32 {
+            call_rust_trait_impl!(self, row_count())
+        }
+        // Inbound, like `QListModelProxyRust::set_data`.
+        fn set_data(&self) {
+            call_rust_trait_impl!(mut self, set_data())
+        }
+        // Outbound, like `QListModelProxyRust::base_begin_insert_rows`.
+        fn base_begin_insert_rows(&self, mut_ref: &mut dyn FakeAdapter) {
+            call_cpp_impl!(mut self, mut_ref, begin_insert_rows())
+        }
+        // Outbound, like `QListModelProxyRust::base_data_changed`.
+        fn base_data_changed(&self, mut_ref: &mut dyn FakeAdapter) {
+            call_cpp_impl!(mut self, mut_ref, data_changed())
+        }
+    }
+
+    impl FakeCpp {
+        fn reenter(&mut self) {
+            // Qt calls rowCount() synchronously from within the notification.
+            let proxy = unsafe { &*self.rust_proxy };
+            let count = proxy.row_count();
+            self.seen_row_counts.push(count);
+        }
+        fn begin_insert_rows(mut self: Pin<&mut Self>) {
+            self.reenter();
+        }
+        fn data_changed(mut self: Pin<&mut Self>) {
+            self.reenter();
+        }
+    }
+
+    impl QCppProxy for FakeCpp {
+        type ProxyRustType = FakeProxy;
+        fn get_static_meta_object() -> &'static QMetaObject {
+            unimplemented!()
+        }
+        fn get_size() -> usize {
+            unimplemented!()
+        }
+        fn get_align() -> usize {
+            unimplemented!()
+        }
+        fn parser_status_cast() -> i32 {
+            unimplemented!()
+        }
+        unsafe fn create(_: *mut FakeProxy, _: &'static DynamicMetaObjectData) -> *mut Self {
+            unimplemented!()
+        }
+        unsafe fn create_at(_: *mut FakeProxy, _: &'static DynamicMetaObjectData, _: *mut u8) -> *mut Self {
+            unimplemented!()
+        }
+        fn emit_signal(self: Pin<&mut Self>, _: &str, _: &[*const u8]) {}
+    }
+
+    /// Returns the raw proxy, as C++ holds it. Free it with `destroy`.
+    fn create_proxy(rows: i32) -> *mut FakeProxy {
+        let model = Rc::new(RefCell::new(Model { rows, proxy: std::ptr::null() }));
+        let adapter: Rc<RefCell<dyn FakeAdapter>> = model.clone();
+        let proxy = Box::into_raw(Box::new(FakeProxy {
+            cpp_proxy: std::ptr::null_mut(),
+            rust_obj: RustObjAccess::new(adapter),
+            on_drop: Box::new(|| {}),
+        }));
+        model.borrow_mut().proxy = proxy;
+        let cpp = Box::into_raw(Box::new(FakeCpp { rust_proxy: proxy, seen_row_counts: Vec::new() }));
+        unsafe { (*proxy).cpp_proxy = cpp };
+        proxy
+    }
+
+    fn destroy(proxy: *mut FakeProxy) -> Vec<i32> {
+        let cpp = unsafe { Box::from_raw((*proxy).cpp_proxy) };
+        unsafe { FakeProxy::drop_self(proxy) };
+        cpp.seen_row_counts
+    }
+
+    #[test]
+    fn require_that_row_count_can_reenter_during_begin_insert_rows_of_a_mutable_slot() {
+        let proxy = create_proxy(3);
+        // C++ -> Rust mutable slot -> notification -> C++ -> rowCount()
+        unsafe { &*proxy }.invoke_slot_mut(0, &[], &[]);
+        unsafe { &*proxy }.invoke_slot_mut(0, &[], &[]);
+        assert_eq!(unsafe { &*proxy }.row_count(), 5);
+        assert_eq!(destroy(proxy), vec![3, 4]);
+    }
+
+    #[test]
+    fn require_that_row_count_can_reenter_during_data_changed_of_set_data() {
+        let proxy = create_proxy(2);
+        // C++ -> Rust setData -> notification -> C++ -> rowCount()
+        unsafe { &*proxy }.set_data();
+        assert_eq!(destroy(proxy), vec![2]);
+    }
+}

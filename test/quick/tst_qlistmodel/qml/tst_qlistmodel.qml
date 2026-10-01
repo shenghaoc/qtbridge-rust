@@ -26,6 +26,31 @@ TestCase {
         visible: true
     }
 
+    // Qt emits the *AboutTo* signals synchronously from within the
+    // begin*() calls issued by the Rust model. Handlers that query the model
+    // therefore re-enter the Rust proxy while the notification call is
+    // still on the stack.
+    property var reentrantRowCounts: []
+    property bool observeReset: false
+    Connections {
+        target: rustmodel
+        function onRowsAboutToBeInserted() {
+            test.reentrantRowCounts.push(rustmodel.rowCount())
+        }
+        function onRowsAboutToBeRemoved() {
+            test.reentrantRowCounts.push(rustmodel.rowCount())
+        }
+        function onModelAboutToBeReset() {
+            // roleNames() is not invokable from QML; the ListView's
+            // delegate model queries it from this same signal.
+            if (test.observeReset)
+                test.reentrantRowCounts.push(rustmodel.rowCount())
+        }
+        function onDataChanged() {
+            test.reentrantRowCounts.push(rustmodel.rowCount())
+        }
+    }
+
     function check_sync() {
         listview.forceLayout()
 
@@ -36,6 +61,39 @@ TestCase {
             compare(listview.itemAtIndex(i).decoration, rustmodel.data(index, 1), "[" + i + "].decoration")
             compare(listview.itemAtIndex(i).display, rustmodel.data(index, 0), "[" + i + "].display")
         }
+    }
+
+    // These three tests deliberately avoid resetItems() and sort before
+    // test_init() (QtTest runs test functions alphabetically): a reset also
+    // re-enters the model (the ListView queries roleNames()), which would
+    // otherwise hide failures of the notification under test.
+    function test_basic_reentrant_insert() {
+        const base = rustmodel.rowCount()
+        reentrantRowCounts = []
+        rustmodel.pushFourItems()
+        // rowCount() as seen from rowsAboutToBeInserted: before each push
+        compare(reentrantRowCounts, [base, base + 1, base + 2, base + 3])
+        compare(rustmodel.rowCount(), base + 4)
+        check_sync()
+    }
+
+    function test_basic_reentrant_remove() {
+        rustmodel.pushFourItems()
+        const base = rustmodel.rowCount()
+        reentrantRowCounts = []
+        rustmodel.removeFirstTwoItems()
+        compare(reentrantRowCounts, [base, base - 1])
+        compare(rustmodel.rowCount(), base - 2)
+        check_sync()
+    }
+
+    function test_basic_reentrant_data_changed() {
+        rustmodel.pushFourItems()
+        const base = rustmodel.rowCount()
+        reentrantRowCounts = []
+        rustmodel.setTwoToNull()
+        compare(reentrantRowCounts, [base, base])
+        check_sync()
     }
 
     function test_init() {
@@ -96,6 +154,16 @@ TestCase {
         compare(rustmodel.data(rustmodel.index(2, 0), 1), "")
         compare(rustmodel.data(rustmodel.index(1, 0), 0), "")
         compare(rustmodel.data(rustmodel.index(2, 0), 0), "")
+        check_sync()
+    }
+
+    function test_reentrant_on_reset() {
+        rustmodel.resetItems()
+        reentrantRowCounts = []
+        observeReset = true
+        rustmodel.resetItems()
+        observeReset = false
+        compare(reentrantRowCounts, [3])
         check_sync()
     }
 }

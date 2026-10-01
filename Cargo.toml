@@ -85,3 +85,11 @@ default-members = [
 # because a package being dependency is built twice with different optimization settings.
 # Hardcode optimization level to help cargo deduplicate dependencies and run build script only once.
 opt-level = 3
+
+# The re-entrancy regression tests (tst_qlistmodel & co.) only fail when the
+# proxy glue is optimized: an exclusive `&mut` receiver lets LLVM assume (via
+# `noalias`) that the borrow state published to `RustObjAccess` before a Qt
+# call is never observed, and drop that store. Optimize just that crate for
+# `cargo test` so a plain debug test run catches such regressions.
+[profile.test.package.qtbridge-interfaces]
+opt-level = 3
